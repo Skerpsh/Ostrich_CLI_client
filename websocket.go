@@ -6,7 +6,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const websocketURL = "ws://62.238.111.55:3000/ws"
+const websocketURL = "wss://62.238.111.55.nip.io/ws"
 
 type WSMessage struct {
 	Type     string  `json:"type"`

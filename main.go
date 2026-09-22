@@ -14,7 +14,7 @@ import (
 	"golang.org/x/term"
 )
 
-const serverURL = "http://62.238.111.55:3000"
+const serverURL = "https://62.238.111.55.nip.io"
 
 type LoginResponse struct {
 	Message string `json:"message"`
@@ -130,7 +130,7 @@ func printMessages(messages []Message) {
 
 func connectAndJoin(token, chatID string) (*websocket.Conn, error) {
 	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws://62.238.111.55:3000/ws?token="+token,
+		"wss://62.238.111.55.nip.io/ws?token="+token,
 		nil,
 	)
 	if err != nil {
