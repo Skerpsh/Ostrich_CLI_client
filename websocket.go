@@ -20,10 +20,16 @@ type WSMessage struct {
 	Message  *Message `json:"message,omitempty"`
 	Error    string   `json:"error,omitempty"`
 	Username string   `json:"username,omitempty"`
+
+	// "presence" events.
+	UserID     string  `json:"userId,omitempty"`
+	Online     bool    `json:"online,omitempty"`
+	LastSeenAt *string `json:"lastSeenAt,omitempty"`
 }
 
-// connectWebSocket opens a websocket connection and joins the given chat.
-func connectWebSocket(token, chatID string) (*websocket.Conn, error) {
+// connectWebSocket opens the session's websocket connection. While it is
+// open the user is shown as online to their contacts.
+func connectWebSocket(token string) (*websocket.Conn, error) {
 	dialer := websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: wsHandshakeTimeout,
@@ -49,7 +55,7 @@ func connectWebSocket(token, chatID string) (*websocket.Conn, error) {
 
 	conn.SetReadLimit(wsReadLimit)
 
-	if err := joinChat(conn, chatID); err != nil {
+	if err := waitConnected(conn); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -57,7 +63,8 @@ func connectWebSocket(token, chatID string) (*websocket.Conn, error) {
 	return conn, nil
 }
 
-func joinChat(conn *websocket.Conn, chatID string) error {
+// waitConnected reads the server's greeting.
+func waitConnected(conn *websocket.Conn) error {
 	// Bound the handshake so an unresponsive server can't hang the UI.
 	if err := conn.SetReadDeadline(time.Now().Add(wsHandshakeTimeout)); err != nil {
 		return err
@@ -76,28 +83,23 @@ func joinChat(conn *websocket.Conn, chatID string) error {
 		)
 	}
 
-	if err := writeWebSocketJSON(conn, map[string]string{
+	return conn.SetReadDeadline(time.Time{})
+}
+
+// joinChat subscribes to a chat's messages; the server answers "joined"
+// followed by the presence of the other members.
+func joinChat(conn *websocket.Conn, chatID string) error {
+	return writeWebSocketJSON(conn, map[string]string{
 		"type":   "join",
 		"chatId": chatID,
-	}); err != nil {
-		return err
-	}
+	})
+}
 
-	var joined WSMessage
-
-	if err := conn.ReadJSON(&joined); err != nil {
-		return err
-	}
-
-	if joined.Type != "joined" {
-		if joined.Error != "" {
-			return fmt.Errorf("failed to join chat: %s", joined.Error)
-		}
-
-		return fmt.Errorf("failed to join chat")
-	}
-
-	return conn.SetReadDeadline(time.Time{})
+func leaveChat(conn *websocket.Conn, chatID string) error {
+	return writeWebSocketJSON(conn, map[string]string{
+		"type":   "leave",
+		"chatId": chatID,
+	})
 }
 
 func writeWebSocketJSON(conn *websocket.Conn, v any) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -34,15 +35,18 @@ type chatsErrorMsg struct {
 	err error
 }
 
-type chatOpenedMsg struct {
+// historyLoadedMsg carries a chat's history. open is true when the chat is
+// being opened, false for a reload after (re)joining it.
+type historyLoadedMsg struct {
 	chat     Chat
 	messages []Message
-	conn     *websocket.Conn
+	open     bool
 }
 
-type chatOpenErrorMsg struct {
-	chatID string
-	err    error
+type historyErrorMsg struct {
+	chat Chat
+	err  error
+	open bool
 }
 
 type chatCreatedMsg struct {
@@ -50,6 +54,18 @@ type chatCreatedMsg struct {
 }
 
 type chatCreateErrorMsg struct {
+	err error
+}
+
+// Connection attempts carry the generation they were started for, so
+// results of attempts from a previous session are dropped.
+type wsConnectedMsg struct {
+	gen  int
+	conn *websocket.Conn
+}
+
+type wsConnectErrorMsg struct {
+	gen int
 	err error
 }
 
@@ -65,6 +81,9 @@ type wsErrorMsg struct {
 	err  error
 }
 
+// Redraws relative times ("last seen 5 min ago").
+type minuteTickMsg struct{}
+
 type tuiStage int
 
 const (
@@ -78,6 +97,14 @@ type authMode int
 const (
 	authLogin authMode = iota
 	authRegister
+)
+
+type connStatus int
+
+const (
+	connOffline connStatus = iota
+	connConnecting
+	connOnline
 )
 
 type tuiModel struct {
@@ -104,8 +131,8 @@ type tuiModel struct {
 	creatingChat bool
 	loginIDInput textinput.Model
 
-	// ID of the chat being opened or reconnected; results for any other
-	// chat are stale and get discarded.
+	// ID of the chat being opened; results for any other chat are stale
+	// and get discarded.
 	pendingChatID string
 
 	currentChat  Chat
@@ -115,7 +142,13 @@ type tuiModel struct {
 	// Number of newest messages scrolled out of view; 0 follows the latest.
 	messageScroll int
 
-	conn *websocket.Conn
+	// The session's websocket, open for as long as the user is logged in.
+	conn       *websocket.Conn
+	connStatus connStatus
+	connGen    int
+
+	// Presence of other users by user ID.
+	presence map[string]presence
 }
 
 var (
@@ -140,6 +173,9 @@ var (
 
 	hintStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241"))
+
+	onlineStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10"))
 
 	selectedChatStyle = lipgloss.NewStyle().
 				Bold(true).
@@ -200,6 +236,7 @@ func newLoginModel() tuiModel {
 		focus:           0,
 		messageInput:    messageInput,
 		loginIDInput:    loginIDInput,
+		presence:        map[string]presence{},
 	}
 }
 
@@ -235,12 +272,79 @@ func createChatCmd(token, loginID string) tea.Cmd {
 	}
 }
 
-// quit ends the session on the server and exits.
-func (m tuiModel) quit() (tea.Model, tea.Cmd) {
+func loadChatsCmd(token string) tea.Cmd {
+	return func() tea.Msg {
+		chats, err := getChats(token)
+
+		if err != nil {
+			return chatsErrorMsg{err: err}
+		}
+
+		return chatsLoadedMsg{chats: chats}
+	}
+}
+
+func loadHistoryCmd(token string, chat Chat, open bool) tea.Cmd {
+	return func() tea.Msg {
+		messages, err := getMessages(token, chat.ID)
+
+		if err != nil {
+			return historyErrorMsg{chat: chat, err: err, open: open}
+		}
+
+		return historyLoadedMsg{chat: chat, messages: messages, open: open}
+	}
+}
+
+// connectCmd opens the session's websocket after the given delay (used
+// for reconnect attempts).
+func connectCmd(token string, gen int, delay time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(delay)
+
+		conn, err := connectWebSocket(token)
+		if err != nil {
+			return wsConnectErrorMsg{gen: gen, err: err}
+		}
+
+		return wsConnectedMsg{gen: gen, conn: conn}
+	}
+}
+
+func listenTUIWebSocket(conn *websocket.Conn) tea.Cmd {
+	return func() tea.Msg {
+		var message WSMessage
+
+		if err := conn.ReadJSON(&message); err != nil {
+			return wsErrorMsg{conn: conn, err: err}
+		}
+
+		return wsMessageMsg{conn: conn, message: message}
+	}
+}
+
+func minuteTick() tea.Cmd {
+	return tea.Tick(time.Minute, func(time.Time) tea.Msg {
+		return minuteTickMsg{}
+	})
+}
+
+// closeConnection closes the session's websocket and cancels pending
+// connection attempts.
+func (m *tuiModel) closeConnection() {
+	m.connGen++
+
 	if m.conn != nil {
 		m.conn.Close()
 		m.conn = nil
 	}
+
+	m.connStatus = connOffline
+}
+
+// quit ends the session on the server and exits.
+func (m tuiModel) quit() (tea.Model, tea.Cmd) {
+	m.closeConnection()
 
 	if m.user == nil {
 		return m, tea.Quit
@@ -259,10 +363,7 @@ func (m tuiModel) quit() (tea.Model, tea.Cmd) {
 
 // sessionExpired returns to the login screen.
 func (m tuiModel) sessionExpired() (tea.Model, tea.Cmd) {
-	if m.conn != nil {
-		m.conn.Close()
-		m.conn = nil
-	}
+	m.closeConnection()
 
 	m.messageInput.Blur()
 	m.loginIDInput.Blur()
@@ -272,6 +373,7 @@ func (m tuiModel) sessionExpired() (tea.Model, tea.Cmd) {
 	m.user = nil
 	m.chats = nil
 	m.messages = nil
+	m.presence = map[string]presence{}
 	m.stage = stageLogin
 	m.authMode = authLogin
 	m.password.SetValue("")
@@ -283,59 +385,57 @@ func (m tuiModel) sessionExpired() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func loadChatsCmd(token string) tea.Cmd {
-	return func() tea.Msg {
-		chats, err := getChats(token)
+func (m *tuiModel) setPresence(userID string, online bool, lastSeenAt *string) {
+	m.presence[userID] = presence{online: online, lastSeen: parseTime(lastSeenAt)}
+}
 
-		if err != nil {
-			return chatsErrorMsg{err: err}
-		}
+// openChat joins the chat and loads its history.
+func (m tuiModel) openChat(chat Chat) (tea.Model, tea.Cmd) {
+	m.loading = true
+	m.err = nil
+	m.pendingChatID = chat.ID
 
-		return chatsLoadedMsg{chats: chats}
+	// Without a connection the chat is joined once it is reconnected.
+	if m.conn != nil {
+		_ = joinChat(m.conn, chat.ID)
+	}
+
+	return m, loadHistoryCmd(m.user.Token, chat, true)
+}
+
+// leaveChatIfConnected stops receiving a chat's messages.
+func (m tuiModel) leaveChatIfConnected(chatID string) {
+	if m.conn != nil {
+		_ = leaveChat(m.conn, chatID)
 	}
 }
 
-// openChatCmd connects to the chat and loads its history after the given
-// delay (used for reconnect attempts).
-func openChatCmd(token string, chat Chat, delay time.Duration) tea.Cmd {
-	return func() tea.Msg {
-		time.Sleep(delay)
+// mergeMessages adds messages that are not there yet, keeping the order
+// by creation time.
+func (m *tuiModel) mergeMessages(messages []Message) {
+	added := false
 
-		// Join before loading history so no message is lost in between;
-		// duplicates are filtered when websocket messages arrive.
-		conn, err := connectWebSocket(token, chat.ID)
-		if err != nil {
-			return chatOpenErrorMsg{chatID: chat.ID, err: err}
-		}
+	for _, message := range messages {
+		if !m.hasMessage(message.ID) {
+			m.messages = append(m.messages, message)
+			added = true
 
-		messages, err := getMessages(token, chat.ID)
-		if err != nil {
-			conn.Close()
-			return chatOpenErrorMsg{chatID: chat.ID, err: err}
-		}
-
-		return chatOpenedMsg{
-			chat:     chat,
-			messages: messages,
-			conn:     conn,
+			// Keep a scrolled-up view in place.
+			if m.messageScroll > 0 {
+				m.messageScroll++
+			}
 		}
 	}
-}
 
-func listenTUIWebSocket(conn *websocket.Conn) tea.Cmd {
-	return func() tea.Msg {
-		var message WSMessage
-
-		if err := conn.ReadJSON(&message); err != nil {
-			return wsErrorMsg{conn: conn, err: err}
-		}
-
-		return wsMessageMsg{conn: conn, message: message}
+	if added {
+		sort.SliceStable(m.messages, func(i, j int) bool {
+			return m.messages[i].CreatedAt < m.messages[j].CreatedAt
+		})
 	}
 }
 
 func (m tuiModel) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, minuteTick())
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -346,12 +446,22 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.messageScroll = min(m.messageScroll, m.maxMessageScroll())
 
+	case minuteTickMsg:
+		return m, minuteTick()
+
 	case authSuccessMsg:
 		m.loading = true
 		m.user = msg.result
 		m.err = nil
+		m.presence = map[string]presence{}
 
-		return m, loadChatsCmd(msg.result.Token)
+		m.closeConnection()
+		m.connStatus = connConnecting
+
+		return m, tea.Batch(
+			loadChatsCmd(msg.result.Token),
+			connectCmd(msg.result.Token, m.connGen, 0),
+		)
 
 	case authErrorMsg:
 		m.loading = false
@@ -374,6 +484,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if chat.ID == selectedID {
 				m.selected = i
 			}
+
+			m.setPresence(chat.UserID, chat.Online, chat.LastSeenAt)
 		}
 
 		if m.stage == stageLogin {
@@ -393,6 +505,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Logged in, but the chats could not be loaded.
 			m.loading = false
 			m.user = nil
+			m.closeConnection()
 		}
 
 		m.err = msg.err
@@ -400,20 +513,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case chatCreatedMsg:
-		m.loading = false
 		m.creatingChat = false
 		m.loginIDInput.Blur()
 		m.loginIDInput.SetValue("")
-		m.err = nil
-		m.pendingChatID = msg.chat.ID
+		m.setPresence(msg.chat.UserID, msg.chat.Online, msg.chat.LastSeenAt)
 
 		// Open the chat right away and refresh the list in the background.
-		m.loading = true
+		model, cmd := m.openChat(msg.chat)
 
-		return m, tea.Batch(
-			openChatCmd(m.user.Token, msg.chat, 0),
-			loadChatsCmd(m.user.Token),
-		)
+		return model, tea.Batch(cmd, loadChatsCmd(m.user.Token))
 
 	case chatCreateErrorMsg:
 		if errors.Is(msg.err, errSessionExpired) {
@@ -425,34 +533,84 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, nil
 
-	case chatOpenedMsg:
-		if msg.chat.ID != m.pendingChatID || m.conn != nil {
-			// The user left the chat before it finished opening, or this
-			// is a stale reconnect for a chat that is already connected.
-			msg.conn.Close()
+	case historyLoadedMsg:
+		if !msg.open {
+			// Reload after (re)joining: add what was missed.
+			if m.stage == stageChat && m.currentChat.ID == msg.chat.ID {
+				m.mergeMessages(msg.messages)
+			}
+
 			return m, nil
 		}
 
-		// On reconnect keep whatever the user has typed so far.
-		if m.stage != stageChat {
-			m.messageInput.SetValue("")
+		if msg.chat.ID != m.pendingChatID {
+			// The user left before the chat finished opening.
+			if m.stage != stageChat || m.currentChat.ID != msg.chat.ID {
+				m.leaveChatIfConnected(msg.chat.ID)
+			}
+
+			return m, nil
 		}
 
 		m.pendingChatID = ""
 		m.loading = false
 		m.currentChat = msg.chat
-		m.messages = msg.messages
-		m.conn = msg.conn
+		m.messages = nil
 		m.messageScroll = 0
+		m.mergeMessages(msg.messages)
 		m.stage = stageChat
 		m.err = nil
 
+		m.messageInput.SetValue("")
 		m.messageInput.Focus()
 
-		return m, listenTUIWebSocket(m.conn)
+		return m, nil
 
-	case chatOpenErrorMsg:
-		if msg.chatID != m.pendingChatID {
+	case historyErrorMsg:
+		if errors.Is(msg.err, errSessionExpired) {
+			return m.sessionExpired()
+		}
+
+		if msg.open {
+			if msg.chat.ID != m.pendingChatID {
+				return m, nil
+			}
+
+			m.leaveChatIfConnected(msg.chat.ID)
+			m.pendingChatID = ""
+			m.loading = false
+		}
+
+		m.err = msg.err
+
+		return m, nil
+
+	case wsConnectedMsg:
+		if msg.gen != m.connGen || m.user == nil || m.conn != nil {
+			msg.conn.Close()
+			return m, nil
+		}
+
+		m.conn = msg.conn
+		m.connStatus = connOnline
+
+		// Re-join what is open; the "joined" answer reloads missed history.
+		if m.stage == stageChat {
+			_ = joinChat(m.conn, m.currentChat.ID)
+		}
+
+		if m.pendingChatID != "" {
+			_ = joinChat(m.conn, m.pendingChatID)
+		}
+
+		return m, tea.Batch(
+			listenTUIWebSocket(m.conn),
+			// Presence may have changed while disconnected.
+			loadChatsCmd(m.user.Token),
+		)
+
+	case wsConnectErrorMsg:
+		if msg.gen != m.connGen || m.user == nil {
 			return m, nil
 		}
 
@@ -460,18 +618,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.sessionExpired()
 		}
 
-		if m.stage == stageChat {
-			// Reconnect failed; keep retrying while the chat is open.
-			m.err = fmt.Errorf("reconnect failed: %v (retrying...)", msg.err)
+		m.connStatus = connConnecting
 
-			return m, openChatCmd(m.user.Token, m.currentChat, reconnectDelay)
-		}
-
-		m.pendingChatID = ""
-		m.loading = false
-		m.err = msg.err
-
-		return m, nil
+		return m, connectCmd(m.user.Token, m.connGen, reconnectDelay)
 
 	case wsMessageMsg:
 		if msg.conn != m.conn {
@@ -479,19 +628,30 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		var cmd tea.Cmd
+
 		switch msg.message.Type {
+		case "joined":
+			if m.stage == stageChat && msg.message.ChatID == m.currentChat.ID {
+				cmd = loadHistoryCmd(m.user.Token, m.currentChat, false)
+			}
+
 		case "message":
 			message := msg.message.Message
 
 			if message != nil &&
-				(message.ChatID == "" || message.ChatID == m.currentChat.ID) &&
-				!m.hasMessage(message.ID) {
-				m.messages = append(m.messages, *message)
+				m.stage == stageChat &&
+				message.ChatID == m.currentChat.ID {
+				m.mergeMessages([]Message{*message})
+			}
 
-				// Keep a scrolled-up view in place.
-				if m.messageScroll > 0 {
-					m.messageScroll++
-				}
+		case "presence":
+			if msg.message.UserID != "" {
+				m.setPresence(
+					msg.message.UserID,
+					msg.message.Online,
+					msg.message.LastSeenAt,
+				)
 			}
 
 		case "error":
@@ -501,23 +661,19 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 		}
 
-		return m, listenTUIWebSocket(m.conn)
+		return m, tea.Batch(cmd, listenTUIWebSocket(m.conn))
 
 	case wsErrorMsg:
 		if msg.conn != m.conn {
-			// Connection was closed on purpose (Esc or replaced).
+			// Connection was closed on purpose or replaced.
 			return m, nil
 		}
 
 		m.conn.Close()
 		m.conn = nil
-		m.err = fmt.Errorf(
-			"websocket disconnected: %v (reconnecting...)",
-			msg.err,
-		)
-		m.pendingChatID = m.currentChat.ID
+		m.connStatus = connConnecting
 
-		return m, openChatCmd(m.user.Token, m.currentChat, reconnectDelay)
+		return m, connectCmd(m.user.Token, m.connGen, reconnectDelay)
 
 	case tea.KeyMsg:
 
@@ -729,17 +885,7 @@ func (m tuiModel) updateChats(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		selectedChat := m.chats[m.selected]
-
-		m.loading = true
-		m.err = nil
-		m.pendingChatID = selectedChat.ID
-
-		return m, openChatCmd(
-			m.user.Token,
-			selectedChat,
-			0,
-		)
+		return m.openChat(m.chats[m.selected])
 	}
 
 	return m, nil
@@ -787,13 +933,9 @@ func (m tuiModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 
 	case "esc":
-		if m.conn != nil {
-			m.conn.Close()
-			m.conn = nil
-		}
-
-		// Also cancels a reconnect in progress.
-		m.pendingChatID = ""
+		// The connection stays open (keeps the user online); only stop
+		// receiving this chat's messages.
+		m.leaveChatIfConnected(m.currentChat.ID)
 
 		m.messageInput.Blur()
 		m.stage = stageChats
@@ -1014,6 +1156,24 @@ func (m tuiModel) loginView() string {
 	return b.String()
 }
 
+// presenceText renders a user's presence: a green "● online" or a grey
+// "last seen ...".
+func (m tuiModel) presenceText(userID string) string {
+	p, ok := m.presence[userID]
+
+	if !ok {
+		return ""
+	}
+
+	text := formatPresence(&p, time.Now())
+
+	if p.online {
+		return onlineStyle.Render("● " + text)
+	}
+
+	return hintStyle.Render(text)
+}
+
 func (m tuiModel) chatsView() string {
 	var b strings.Builder
 
@@ -1026,6 +1186,10 @@ func (m tuiModel) chatsView() string {
 	}
 
 	b.WriteString(logoStyle.Render(title))
+
+	if m.connStatus != connOnline {
+		b.WriteString("   " + hintStyle.Render("connecting..."))
+	}
 
 	if m.user != nil {
 		b.WriteString("\n")
@@ -1056,18 +1220,17 @@ func (m tuiModel) chatsView() string {
 				cursor = "▶ "
 			}
 
-			line := fmt.Sprintf(
-				"%s%s\n  %s",
-				cursor,
-				sanitize(chat.Username),
-				chat.LoginID,
-			)
+			name := cursor + sanitize(chat.Username)
 
 			if i == m.selected {
-				line = selectedChatStyle.Render(line)
+				name = selectedChatStyle.Render(name)
 			}
 
-			chatList.WriteString(line)
+			chatList.WriteString(name + "\n  " + chat.LoginID)
+
+			if status := m.presenceText(chat.UserID); status != "" {
+				chatList.WriteString("  " + status)
+			}
 
 			if i < end-1 {
 				chatList.WriteString("\n\n")
@@ -1332,16 +1495,23 @@ func (m tuiModel) chatView() string {
 
 	var status []string
 
+	// The peer's presence is only known while we are connected ourselves.
+	if m.connStatus != connOnline {
+		status = append(status, hintStyle.Render("connecting..."))
+	} else if peer := m.presenceText(m.currentChat.UserID); peer != "" {
+		status = append(status, peer)
+	}
+
 	if start > 0 {
-		status = append(status, fmt.Sprintf("↑ %d older", start))
+		status = append(status, hintStyle.Render(fmt.Sprintf("↑ %d older", start)))
 	}
 
 	if end < len(rendered) {
-		status = append(status, fmt.Sprintf("↓ %d newer", len(rendered)-end))
+		status = append(status, hintStyle.Render(fmt.Sprintf("↓ %d newer", len(rendered)-end)))
 	}
 
 	if len(status) > 0 {
-		header += "   " + hintStyle.Render(strings.Join(status, "   "))
+		header += "   " + strings.Join(status, "   ")
 	}
 
 	return "\n" + header + "\n\n" + messageBox + "\n\n" + m.chatFooter(boxWidth)

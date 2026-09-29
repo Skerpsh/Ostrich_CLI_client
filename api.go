@@ -56,6 +56,10 @@ type Chat struct {
 	UserID   string `json:"user_id"`
 	LoginID  string `json:"login_id"`
 	Username string `json:"username"`
+
+	// Presence of the other user.
+	Online     bool    `json:"online"`
+	LastSeenAt *string `json:"last_seen_at"`
 }
 
 type ChatsResponse struct {
@@ -238,9 +242,11 @@ type createChatResponse struct {
 	} `json:"chat"`
 
 	User struct {
-		ID       string `json:"id"`
-		LoginID  string `json:"login_id"`
-		Username string `json:"username"`
+		ID         string  `json:"id"`
+		LoginID    string  `json:"login_id"`
+		Username   string  `json:"username"`
+		Online     bool    `json:"online"`
+		LastSeenAt *string `json:"last_seen_at"`
 	} `json:"user"`
 }
 
@@ -263,6 +269,9 @@ func createChat(token, loginID string) (Chat, error) {
 		UserID:   result.User.ID,
 		LoginID:  result.User.LoginID,
 		Username: result.User.Username,
+
+		Online:     result.User.Online,
+		LastSeenAt: result.User.LastSeenAt,
 	}, nil
 }
 
