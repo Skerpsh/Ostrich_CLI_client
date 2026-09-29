@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,19 +13,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type loginSuccessMsg struct {
+const (
+	reconnectDelay = 3 * time.Second
+	scrollStep     = 5
+)
+
+type authSuccessMsg struct {
 	result *LoginResponse
 }
 
-type loginErrorMsg struct {
-	err error
-}
-
-type registerSuccessMsg struct {
-	result *LoginResponse
-}
-
-type registerErrorMsg struct {
+type authErrorMsg struct {
 	err error
 }
 
@@ -41,15 +41,28 @@ type chatOpenedMsg struct {
 }
 
 type chatOpenErrorMsg struct {
+	chatID string
+	err    error
+}
+
+type chatCreatedMsg struct {
+	chat Chat
+}
+
+type chatCreateErrorMsg struct {
 	err error
 }
 
+// Websocket events carry the connection they were read from, so events
+// from a connection that has already been replaced can be dropped.
 type wsMessageMsg struct {
+	conn    *websocket.Conn
 	message WSMessage
 }
 
 type wsErrorMsg struct {
-	err error
+	conn *websocket.Conn
+	err  error
 }
 
 type tuiStage int
@@ -87,9 +100,20 @@ type tuiModel struct {
 	chats    []Chat
 	selected int
 
+	// "New chat" prompt on the chats screen.
+	creatingChat bool
+	loginIDInput textinput.Model
+
+	// ID of the chat being opened or reconnected; results for any other
+	// chat are stale and get discarded.
+	pendingChatID string
+
 	currentChat  Chat
 	messages     []Message
 	messageInput textinput.Model
+
+	// Number of newest messages scrolled out of view; 0 follows the latest.
+	messageScroll int
 
 	conn *websocket.Conn
 }
@@ -162,6 +186,11 @@ func newLoginModel() tuiModel {
 	messageInput.CharLimit = 4096
 	messageInput.Width = 60
 
+	loginIDInput := textinput.New()
+	loginIDInput.Placeholder = "Login ID"
+	loginIDInput.CharLimit = 18
+	loginIDInput.Width = 30
+
 	return tuiModel{
 		stage:           stageLogin,
 		authMode:        authLogin,
@@ -170,7 +199,88 @@ func newLoginModel() tuiModel {
 		confirmPassword: confirmPassword,
 		focus:           0,
 		messageInput:    messageInput,
+		loginIDInput:    loginIDInput,
 	}
+}
+
+// sanitize removes terminal control characters (escape sequences, bidi
+// overrides) from server-provided text so that other users cannot mess
+// with the terminal. Newlines are kept, tabs become spaces.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n':
+			return r
+		case r == '\t':
+			return ' '
+		case unicode.IsControl(r),
+			r >= '‪' && r <= '‮',
+			r >= '⁦' && r <= '⁩':
+			return -1
+		}
+
+		return r
+	}, s)
+}
+
+func createChatCmd(token, loginID string) tea.Cmd {
+	return func() tea.Msg {
+		chat, err := createChat(token, loginID)
+
+		if err != nil {
+			return chatCreateErrorMsg{err: err}
+		}
+
+		return chatCreatedMsg{chat: chat}
+	}
+}
+
+// quit ends the session on the server and exits.
+func (m tuiModel) quit() (tea.Model, tea.Cmd) {
+	if m.conn != nil {
+		m.conn.Close()
+		m.conn = nil
+	}
+
+	if m.user == nil {
+		return m, tea.Quit
+	}
+
+	token := m.user.Token
+
+	return m, tea.Sequence(
+		func() tea.Msg {
+			_ = logout(token)
+			return nil
+		},
+		tea.Quit,
+	)
+}
+
+// sessionExpired returns to the login screen.
+func (m tuiModel) sessionExpired() (tea.Model, tea.Cmd) {
+	if m.conn != nil {
+		m.conn.Close()
+		m.conn = nil
+	}
+
+	m.messageInput.Blur()
+	m.loginIDInput.Blur()
+	m.creatingChat = false
+	m.pendingChatID = ""
+	m.loading = false
+	m.user = nil
+	m.chats = nil
+	m.messages = nil
+	m.stage = stageLogin
+	m.authMode = authLogin
+	m.password.SetValue("")
+	m.confirmPassword.SetValue("")
+	m.focus = 0
+	m.moveFocus(0)
+	m.err = errSessionExpired
+
+	return m, nil
 }
 
 func loadChatsCmd(token string) tea.Cmd {
@@ -185,16 +295,23 @@ func loadChatsCmd(token string) tea.Cmd {
 	}
 }
 
-func openChatCmd(token string, chat Chat) tea.Cmd {
+// openChatCmd connects to the chat and loads its history after the given
+// delay (used for reconnect attempts).
+func openChatCmd(token string, chat Chat, delay time.Duration) tea.Cmd {
 	return func() tea.Msg {
-		messages, err := getMessages(token, chat.ID)
+		time.Sleep(delay)
+
+		// Join before loading history so no message is lost in between;
+		// duplicates are filtered when websocket messages arrive.
+		conn, err := connectWebSocket(token, chat.ID)
 		if err != nil {
-			return chatOpenErrorMsg{err: err}
+			return chatOpenErrorMsg{chatID: chat.ID, err: err}
 		}
 
-		conn, err := connectTUIWebSocket(token, chat.ID)
+		messages, err := getMessages(token, chat.ID)
 		if err != nil {
-			return chatOpenErrorMsg{err: err}
+			conn.Close()
+			return chatOpenErrorMsg{chatID: chat.ID, err: err}
 		}
 
 		return chatOpenedMsg{
@@ -205,64 +322,15 @@ func openChatCmd(token string, chat Chat) tea.Cmd {
 	}
 }
 
-func connectTUIWebSocket(token, chatID string) (*websocket.Conn, error) {
-	conn, _, err := websocket.DefaultDialer.Dial(
-		websocketURL+"?token="+token,
-		nil,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	var connected WSMessage
-
-	if err := conn.ReadJSON(&connected); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	if connected.Type != "connected" {
-		conn.Close()
-
-		return nil, fmt.Errorf(
-			"unexpected websocket response: %s",
-			connected.Type,
-		)
-	}
-
-	if err := conn.WriteJSON(map[string]string{
-		"type":   "join",
-		"chatId": chatID,
-	}); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	var joined WSMessage
-
-	if err := conn.ReadJSON(&joined); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	if joined.Type != "joined" {
-		conn.Close()
-		return nil, fmt.Errorf("failed to join chat")
-	}
-
-	return conn, nil
-}
-
 func listenTUIWebSocket(conn *websocket.Conn) tea.Cmd {
 	return func() tea.Msg {
 		var message WSMessage
 
 		if err := conn.ReadJSON(&message); err != nil {
-			return wsErrorMsg{err: err}
+			return wsErrorMsg{conn: conn, err: err}
 		}
 
-		return wsMessageMsg{message: message}
+		return wsMessageMsg{conn: conn, message: message}
 	}
 }
 
@@ -276,81 +344,154 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.messageScroll = min(m.messageScroll, m.maxMessageScroll())
 
-	case loginSuccessMsg:
+	case authSuccessMsg:
 		m.loading = true
 		m.user = msg.result
 		m.err = nil
 
 		return m, loadChatsCmd(msg.result.Token)
 
-	case loginErrorMsg:
-		m.loading = false
-		m.err = msg.err
-
-		return m, nil
-
-	case registerSuccessMsg:
-		m.loading = true
-		m.user = msg.result
-		m.err = nil
-
-		return m, loadChatsCmd(msg.result.Token)
-
-	case registerErrorMsg:
+	case authErrorMsg:
 		m.loading = false
 		m.err = msg.err
 
 		return m, nil
 
 	case chatsLoadedMsg:
-		m.loading = false
+		// Keep the cursor on the same chat after a refresh.
+		selectedID := ""
+
+		if m.selected < len(m.chats) {
+			selectedID = m.chats[m.selected].ID
+		}
+
 		m.chats = msg.chats
-		m.stage = stageChats
-		m.err = nil
 		m.selected = 0
+
+		for i, chat := range m.chats {
+			if chat.ID == selectedID {
+				m.selected = i
+			}
+		}
+
+		if m.stage == stageLogin {
+			m.loading = false
+			m.stage = stageChats
+			m.err = nil
+		}
 
 		return m, nil
 
 	case chatsErrorMsg:
+		if errors.Is(msg.err, errSessionExpired) {
+			return m.sessionExpired()
+		}
+
+		if m.stage == stageLogin {
+			// Logged in, but the chats could not be loaded.
+			m.loading = false
+			m.user = nil
+		}
+
+		m.err = msg.err
+
+		return m, nil
+
+	case chatCreatedMsg:
+		m.loading = false
+		m.creatingChat = false
+		m.loginIDInput.Blur()
+		m.loginIDInput.SetValue("")
+		m.err = nil
+		m.pendingChatID = msg.chat.ID
+
+		// Open the chat right away and refresh the list in the background.
+		m.loading = true
+
+		return m, tea.Batch(
+			openChatCmd(m.user.Token, msg.chat, 0),
+			loadChatsCmd(m.user.Token),
+		)
+
+	case chatCreateErrorMsg:
+		if errors.Is(msg.err, errSessionExpired) {
+			return m.sessionExpired()
+		}
+
 		m.loading = false
 		m.err = msg.err
 
 		return m, nil
 
 	case chatOpenedMsg:
+		if msg.chat.ID != m.pendingChatID || m.conn != nil {
+			// The user left the chat before it finished opening, or this
+			// is a stale reconnect for a chat that is already connected.
+			msg.conn.Close()
+			return m, nil
+		}
+
+		// On reconnect keep whatever the user has typed so far.
+		if m.stage != stageChat {
+			m.messageInput.SetValue("")
+		}
+
+		m.pendingChatID = ""
 		m.loading = false
 		m.currentChat = msg.chat
 		m.messages = msg.messages
 		m.conn = msg.conn
+		m.messageScroll = 0
 		m.stage = stageChat
 		m.err = nil
 
-		m.messageInput.SetValue("")
 		m.messageInput.Focus()
 
 		return m, listenTUIWebSocket(m.conn)
 
 	case chatOpenErrorMsg:
+		if msg.chatID != m.pendingChatID {
+			return m, nil
+		}
+
+		if errors.Is(msg.err, errSessionExpired) {
+			return m.sessionExpired()
+		}
+
+		if m.stage == stageChat {
+			// Reconnect failed; keep retrying while the chat is open.
+			m.err = fmt.Errorf("reconnect failed: %v (retrying...)", msg.err)
+
+			return m, openChatCmd(m.user.Token, m.currentChat, reconnectDelay)
+		}
+
+		m.pendingChatID = ""
 		m.loading = false
 		m.err = msg.err
-
-		if m.conn != nil {
-			m.conn.Close()
-			m.conn = nil
-		}
 
 		return m, nil
 
 	case wsMessageMsg:
-		switch msg.message.Type {
+		if msg.conn != m.conn {
+			// Connection was closed on purpose; nothing to listen to.
+			return m, nil
+		}
 
+		switch msg.message.Type {
 		case "message":
-			if msg.message.Message != nil {
-				m.messages = append(
-					m.messages,
-					*msg.message.Message,
-				)
+			message := msg.message.Message
+
+			if message != nil &&
+				(message.ChatID == "" || message.ChatID == m.currentChat.ID) &&
+				!m.hasMessage(message.ID) {
+				m.messages = append(m.messages, *message)
+
+				// Keep a scrolled-up view in place.
+				if m.messageScroll > 0 {
+					m.messageScroll++
+				}
 			}
 
 		case "error":
@@ -360,39 +501,38 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 		}
 
-		if m.conn != nil {
-			return m, listenTUIWebSocket(m.conn)
-		}
-
-		return m, nil
+		return m, listenTUIWebSocket(m.conn)
 
 	case wsErrorMsg:
+		if msg.conn != m.conn {
+			// Connection was closed on purpose (Esc or replaced).
+			return m, nil
+		}
+
+		m.conn.Close()
+		m.conn = nil
 		m.err = fmt.Errorf(
-			"websocket disconnected: %v",
+			"websocket disconnected: %v (reconnecting...)",
 			msg.err,
 		)
+		m.pendingChatID = m.currentChat.ID
 
-		return m, nil
+		return m, openChatCmd(m.user.Token, m.currentChat, reconnectDelay)
 
 	case tea.KeyMsg:
 
 		if msg.String() == "ctrl+c" {
-			if m.conn != nil {
-				m.conn.Close()
-			}
-
-			return m, tea.Quit
+			return m.quit()
 		}
 
-		if m.stage == stageLogin {
+		switch m.stage {
+		case stageLogin:
 			return m.updateLogin(msg)
-		}
 
-		if m.stage == stageChats {
+		case stageChats:
 			return m.updateChats(msg)
-		}
 
-		if m.stage == stageChat {
+		case stageChat:
 			return m.updateChat(msg)
 		}
 	}
@@ -400,35 +540,67 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m tuiModel) hasMessage(id string) bool {
+	if id == "" {
+		return false
+	}
+
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].ID == id {
+			return true
+		}
+	}
+
+	return false
+}
+
+// moveFocus moves the login form focus by delta fields, wrapping around.
+func (m *tuiModel) moveFocus(delta int) {
+	fields := 2
+
+	if m.authMode == authRegister {
+		fields = 3
+	}
+
+	m.focus = ((m.focus+delta)%fields + fields) % fields
+
+	m.username.Blur()
+	m.password.Blur()
+	m.confirmPassword.Blur()
+
+	switch m.focus {
+	case 0:
+		m.username.Focus()
+
+	case 1:
+		m.password.Focus()
+
+	case 2:
+		m.confirmPassword.Focus()
+	}
+}
+
 func (m tuiModel) updateLogin(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.loading {
 		return m, nil
 	}
 
-	key := msg.String()
-
-	switch key {
-
-	case "q":
-		return m, tea.Quit
+	switch msg.String() {
 
 	case "esc":
 		if m.authMode == authRegister {
 			m.authMode = authLogin
 			m.focus = 0
 			m.err = nil
-
-			m.password.Blur()
-			m.confirmPassword.Blur()
-			m.username.Focus()
+			m.moveFocus(0)
 
 			return m, nil
 		}
 
 		return m, tea.Quit
 
-	// TAB переключает Login <-> Register
-	case "tab":
+	// Tab / Shift+Tab переключают Login <-> Register
+	case "tab", "shift+tab":
 		if m.authMode == authLogin {
 			m.authMode = authRegister
 		} else {
@@ -437,88 +609,18 @@ func (m tuiModel) updateLogin(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		m.focus = 0
 		m.err = nil
-
-		m.username.Focus()
-		m.password.Blur()
-		m.confirmPassword.Blur()
-
-		return m, nil
-
-	// SHIFT+TAB тоже переключает Login <-> Register назад
-	case "shift+tab":
-		if m.authMode == authLogin {
-			m.authMode = authRegister
-		} else {
-			m.authMode = authLogin
-		}
-
-		m.focus = 0
-		m.err = nil
-
-		m.username.Focus()
-		m.password.Blur()
-		m.confirmPassword.Blur()
+		m.moveFocus(0)
 
 		return m, nil
 
 	// Стрелки переключают поля
 	case "up":
-		maxFocus := 1
-
-		if m.authMode == authRegister {
-			maxFocus = 2
-		}
-
-		m.focus--
-
-		if m.focus < 0 {
-			m.focus = maxFocus
-		}
-
-		m.username.Blur()
-		m.password.Blur()
-		m.confirmPassword.Blur()
-
-		switch m.focus {
-		case 0:
-			m.username.Focus()
-
-		case 1:
-			m.password.Focus()
-
-		case 2:
-			m.confirmPassword.Focus()
-		}
+		m.moveFocus(-1)
 
 		return m, nil
 
 	case "down":
-		maxFocus := 1
-
-		if m.authMode == authRegister {
-			maxFocus = 2
-		}
-
-		m.focus++
-
-		if m.focus > maxFocus {
-			m.focus = 0
-		}
-
-		m.username.Blur()
-		m.password.Blur()
-		m.confirmPassword.Blur()
-
-		switch m.focus {
-		case 0:
-			m.username.Focus()
-
-		case 1:
-			m.password.Focus()
-
-		case 2:
-			m.confirmPassword.Focus()
-		}
+		m.moveFocus(1)
 
 		return m, nil
 
@@ -536,8 +638,9 @@ func (m tuiModel) updateLogin(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		if m.authMode == authRegister {
+		auth := loginWithCredentials
 
+		if m.authMode == authRegister {
 			confirmPassword := m.confirmPassword.Value()
 
 			if confirmPassword == "" {
@@ -550,41 +653,21 @@ func (m tuiModel) updateLogin(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			m.loading = true
-			m.err = nil
-
-			return m, func() tea.Msg {
-				result, err := registerWithCredentials(
-					username,
-					password,
-				)
-
-				if err != nil {
-					return registerErrorMsg{err: err}
-				}
-
-				return registerSuccessMsg{
-					result: result,
-				}
-			}
+			auth = registerWithCredentials
 		}
 
 		m.loading = true
+		m.user = nil
 		m.err = nil
 
 		return m, func() tea.Msg {
-			result, err := loginWithCredentials(
-				username,
-				password,
-			)
+			result, err := auth(username, password)
 
 			if err != nil {
-				return loginErrorMsg{err: err}
+				return authErrorMsg{err: err}
 			}
 
-			return loginSuccessMsg{
-				result: result,
-			}
+			return authSuccessMsg{result: result}
 		}
 	}
 
@@ -610,14 +693,26 @@ func (m tuiModel) updateChats(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if len(m.chats) == 0 {
-		return m, nil
+	if m.creatingChat {
+		return m.updateNewChat(msg)
 	}
 
 	switch msg.String() {
 
 	case "q":
-		return m, tea.Quit
+		return m.quit()
+
+	case "n":
+		m.creatingChat = true
+		m.err = nil
+		m.loginIDInput.SetValue("")
+
+		return m, m.loginIDInput.Focus()
+
+	case "r":
+		m.err = nil
+
+		return m, loadChatsCmd(m.user.Token)
 
 	case "up", "k":
 		if m.selected > 0 {
@@ -630,18 +725,62 @@ func (m tuiModel) updateChats(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "enter":
-		m.loading = true
-		m.err = nil
+		if len(m.chats) == 0 {
+			return m, nil
+		}
 
 		selectedChat := m.chats[m.selected]
+
+		m.loading = true
+		m.err = nil
+		m.pendingChatID = selectedChat.ID
 
 		return m, openChatCmd(
 			m.user.Token,
 			selectedChat,
+			0,
 		)
 	}
 
 	return m, nil
+}
+
+func (m tuiModel) updateNewChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+
+	case "esc":
+		m.creatingChat = false
+		m.loginIDInput.Blur()
+		m.err = nil
+
+		return m, nil
+
+	case "enter":
+		loginID := strings.TrimSpace(m.loginIDInput.Value())
+
+		if loginID == "" {
+			m.err = fmt.Errorf("login ID is required")
+			return m, nil
+		}
+
+		for _, r := range loginID {
+			if r < '0' || r > '9' {
+				m.err = fmt.Errorf("login ID must contain only digits")
+				return m, nil
+			}
+		}
+
+		m.loading = true
+		m.err = nil
+
+		return m, createChatCmd(m.user.Token, loginID)
+	}
+
+	var cmd tea.Cmd
+
+	m.loginIDInput, cmd = m.loginIDInput.Update(msg)
+
+	return m, cmd
 }
 
 func (m tuiModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -653,9 +792,34 @@ func (m tuiModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.conn = nil
 		}
 
+		// Also cancels a reconnect in progress.
+		m.pendingChatID = ""
+
 		m.messageInput.Blur()
 		m.stage = stageChats
 		m.err = nil
+		m.messageScroll = 0
+
+		// Chat order may have changed while the chat was open.
+		return m, loadChatsCmd(m.user.Token)
+
+	case "pgup":
+		m.messageScroll = min(m.messageScroll+scrollStep, m.maxMessageScroll())
+
+		return m, nil
+
+	case "pgdown":
+		m.messageScroll = max(m.messageScroll-scrollStep, 0)
+
+		return m, nil
+
+	case "home":
+		m.messageScroll = m.maxMessageScroll()
+
+		return m, nil
+
+	case "end":
+		m.messageScroll = 0
 
 		return m, nil
 
@@ -669,11 +833,11 @@ func (m tuiModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.conn == nil {
-			m.err = fmt.Errorf("websocket is not connected")
+			m.err = fmt.Errorf("not connected, reconnecting...")
 			return m, nil
 		}
 
-		err := m.conn.WriteJSON(map[string]string{
+		err := writeWebSocketJSON(m.conn, map[string]string{
 			"type":    "message",
 			"chatId":  m.currentChat.ID,
 			"content": content,
@@ -685,6 +849,7 @@ func (m tuiModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		m.messageInput.SetValue("")
+		m.messageScroll = 0
 
 		return m, nil
 	}
@@ -760,9 +925,13 @@ func (m tuiModel) loginView() string {
 		registerLabel = "▶ Register"
 	}
 
-	b.WriteString(
-		selectedChatStyle.Render(loginLabel),
-	)
+	if m.authMode == authLogin {
+		b.WriteString(
+			selectedChatStyle.Render(loginLabel),
+		)
+	} else {
+		b.WriteString(loginLabel)
+	}
 
 	b.WriteString("    ")
 
@@ -816,13 +985,13 @@ func (m tuiModel) loginView() string {
 		if m.authMode == authRegister {
 			b.WriteString(
 				hintStyle.Render(
-					"Tab / ↑↓ switch   Enter register   Esc login   Ctrl+C quit",
+					"Tab Login mode   ↑↓ Field   Enter Register   Esc Back   Ctrl+C Quit",
 				),
 			)
 		} else {
 			b.WriteString(
 				hintStyle.Render(
-					"Tab / ↑↓ switch   Enter login   Esc quit   Ctrl+C quit",
+					"Tab Register mode   ↑↓ Field   Enter Login   Esc Quit   Ctrl+C Quit",
 				),
 			)
 		}
@@ -853,10 +1022,16 @@ func (m tuiModel) chatsView() string {
 	title := "OSTRICH"
 
 	if m.user != nil {
-		title += "   @" + m.user.User.Username
+		title += "   @" + sanitize(m.user.User.Username)
 	}
 
 	b.WriteString(logoStyle.Render(title))
+
+	if m.user != nil {
+		b.WriteString("\n")
+		b.WriteString(hintStyle.Render("Your login ID: " + m.user.User.LoginID))
+	}
+
 	b.WriteString("\n\n")
 
 	var chatList strings.Builder
@@ -864,10 +1039,17 @@ func (m tuiModel) chatsView() string {
 	chatList.WriteString("Chats\n\n")
 
 	if len(m.chats) == 0 {
-		chatList.WriteString("No chats.")
+		chatList.WriteString("No chats.\nPress n to start one.")
 	} else {
-		for i, chat := range m.chats {
+		start, end := m.chatListWindow()
 
+		if start > 0 {
+			chatList.WriteString(hintStyle.Render(fmt.Sprintf("↑ %d more", start)))
+			chatList.WriteString("\n\n")
+		}
+
+		for i := start; i < end; i++ {
+			chat := m.chats[i]
 			cursor := "  "
 
 			if i == m.selected {
@@ -875,19 +1057,26 @@ func (m tuiModel) chatsView() string {
 			}
 
 			line := fmt.Sprintf(
-				"%s%s\n  %s\n\n",
+				"%s%s\n  %s",
 				cursor,
-				chat.Username,
+				sanitize(chat.Username),
 				chat.LoginID,
 			)
 
 			if i == m.selected {
-				chatList.WriteString(
-					selectedChatStyle.Render(line),
-				)
-			} else {
-				chatList.WriteString(line)
+				line = selectedChatStyle.Render(line)
 			}
+
+			chatList.WriteString(line)
+
+			if i < end-1 {
+				chatList.WriteString("\n\n")
+			}
+		}
+
+		if end < len(m.chats) {
+			chatList.WriteString("\n\n")
+			chatList.WriteString(hintStyle.Render(fmt.Sprintf("↓ %d more", len(m.chats)-end)))
 		}
 	}
 
@@ -897,10 +1086,20 @@ func (m tuiModel) chatsView() string {
 
 	rightText := "Select a chat\n\n" +
 		"↑ / ↓   Navigate\n" +
-		"Enter    Open chat\n" +
-		"Ctrl+C   Quit"
+		"Enter   Open chat\n" +
+		"n       New chat\n" +
+		"r       Refresh\n" +
+		"q       Quit"
 
-	if m.loading {
+	if m.creatingChat {
+		rightText = "New chat\n\n" +
+			"Enter the login ID of the user:\n\n" +
+			m.loginIDInput.View()
+
+		if m.loading {
+			rightText += "\n\nCreating chat..."
+		}
+	} else if m.loading {
 		rightText = "Opening chat..."
 	}
 
@@ -917,11 +1116,13 @@ func (m tuiModel) chatsView() string {
 	b.WriteString(content)
 	b.WriteString("\n\n")
 
-	b.WriteString(
-		hintStyle.Render(
-			"↑↓ / j k Navigate   Enter Open   Ctrl+C Quit",
-		),
-	)
+	hint := "↑↓ / j k Navigate   Enter Open   n New chat   r Refresh   q / Ctrl+C Quit"
+
+	if m.creatingChat {
+		hint = "Enter Create   Esc Cancel   Ctrl+C Quit"
+	}
+
+	b.WriteString(hintStyle.Render(hint))
 
 	b.WriteString("\n")
 
@@ -938,135 +1139,210 @@ func (m tuiModel) chatsView() string {
 	return b.String()
 }
 
-func (m tuiModel) chatView() string {
-	var b strings.Builder
+// chatListWindow returns the range of chats that fits on screen, keeping
+// the selected chat visible.
+func (m tuiModel) chatListWindow() (start, end int) {
+	height := m.height
 
-	b.WriteString("\n")
+	if height == 0 {
+		height = 24
+	}
 
-	header := fmt.Sprintf(
-		"OSTRICH   /   %s",
-		m.currentChat.Username,
+	// Everything except the list itself: header (4 lines), box border and
+	// padding (4), "Chats" title (2), "more" markers (4), hints and error (4).
+	// Each chat takes 3 lines (name, login ID, blank line).
+	visible := max((height-18)/3, 1)
+
+	start = max(m.selected-visible+1, 0)
+	end = min(start+visible, len(m.chats))
+
+	return start, end
+}
+
+// chatWidths returns the width of the chat boxes (including padding) and
+// of the message text inside them.
+func (m tuiModel) chatWidths() (boxWidth, textWidth int) {
+	boxWidth = max(m.width-4, 40)
+
+	return boxWidth, boxWidth - 4
+}
+
+// chatFooter renders everything below the message box.
+func (m tuiModel) chatFooter(boxWidth int) string {
+	input := m.messageInput
+	// Box padding (2), prompt "> " (2) and cursor (1).
+	input.Width = max(boxWidth-5, 10)
+
+	footer := lipgloss.NewStyle().
+		Width(boxWidth).
+		Border(lipgloss.RoundedBorder()).
+		Padding(0, 1).
+		Render(input.View())
+
+	footer += "\n\n" + hintStyle.Width(boxWidth+2).Render(
+		"Enter Send   PgUp/PgDown Scroll   Home/End Jump   Esc Back   Ctrl+C Quit",
 	)
 
-	b.WriteString(logoStyle.Render(header))
-	b.WriteString("\n\n")
-
-	chatWidth := m.width - 6
-
-	if chatWidth < 50 {
-		chatWidth = 50
+	if m.err != nil {
+		footer += "\n" + errorStyle.
+			Width(boxWidth+2).
+			Render("Error: "+m.err.Error())
 	}
 
-	contentWidth := chatWidth - 8
+	return footer
+}
 
-	if contentWidth < 20 {
-		contentWidth = 20
+// messageAreaHeight returns how many lines of messages fit on screen.
+func (m tuiModel) messageAreaHeight() int {
+	height := m.height
+
+	if height == 0 {
+		height = 24
 	}
 
-	var messageList strings.Builder
+	boxWidth, _ := m.chatWidths()
 
-	if len(m.messages) == 0 {
-		messageList.WriteString(
-			hintStyle.Render("No messages yet."),
-		)
-	} else {
-		start := 0
-		maxVisible := 15
+	// Blank line, header, blank line, message box border and padding (4),
+	// blank line, footer.
+	used := 1 + 1 + 1 + 4 + 1 + lipgloss.Height(m.chatFooter(boxWidth))
 
-		if len(m.messages) > maxVisible {
-			start = len(m.messages) - maxVisible
+	return max(height-used, 1)
+}
+
+func (m tuiModel) renderMessages(textWidth int) []string {
+	rendered := make([]string, len(m.messages))
+
+	for i, message := range m.messages {
+		isOwn := m.user != nil && message.SenderID == m.user.User.ID
+
+		name := message.SenderUsername
+
+		if name == "" {
+			if isOwn {
+				name = m.user.User.Username
+			} else {
+				name = m.currentChat.Username
+			}
 		}
 
-		for _, message := range m.messages[start:] {
-			name := message.SenderUsername
+		style := otherMessageStyle.
+			Width(textWidth).
+			Align(lipgloss.Left)
 
-			if name == "" && m.user != nil {
-				if message.SenderID == m.user.User.ID {
-					name = m.user.User.Username
-				} else {
-					name = m.currentChat.Username
-				}
-			}
+		if isOwn {
+			style = ownMessageStyle.
+				Width(textWidth).
+				Align(lipgloss.Right)
+		}
 
-			text := fmt.Sprintf(
-				"%s: %s",
-				name,
-				message.Content,
-			)
+		rendered[i] = style.Render(sanitize(name) + ": " + sanitize(message.Content))
+	}
 
-			isOwn := false
+	return rendered
+}
 
-			if m.user != nil {
-				isOwn = message.SenderID == m.user.User.ID
-			}
+// messageCost is the number of lines a message takes, counting the blank
+// line that separates it from the previous one.
+func messageCost(rendered string, first bool) int {
+	if first {
+		return lipgloss.Height(rendered)
+	}
 
-			style := lipgloss.NewStyle().
-				Width(contentWidth).
-				MarginBottom(1)
+	return lipgloss.Height(rendered) + 1
+}
 
-			if isOwn {
-				style = style.
-					Align(lipgloss.Right).
-					Foreground(lipgloss.Color("10"))
-			} else {
-				style = style.
-					Align(lipgloss.Left).
-					Foreground(lipgloss.Color("205"))
-			}
+// messageWindow returns the range of messages that fits into area lines
+// when the newest scroll messages are scrolled out of view.
+func messageWindow(rendered []string, area, scroll int) (start, end int) {
+	end = len(rendered) - min(scroll, len(rendered))
+	start = end
+	used := 0
 
-			messageList.WriteString(
-				style.Render(text),
-			)
+	for start > 0 {
+		cost := messageCost(rendered[start-1], start == end)
 
-			messageList.WriteString("\n")
+		// Always show at least one message, even if it is taller than area.
+		if used+cost > area && start < end {
+			break
+		}
+
+		used += cost
+		start--
+	}
+
+	return start, end
+}
+
+// maxScroll returns the scroll value at which the oldest message is at
+// the top of the message area.
+func maxScroll(rendered []string, area int) int {
+	used, fit := 0, 0
+
+	for fit < len(rendered) {
+		cost := messageCost(rendered[fit], fit == 0)
+
+		if used+cost > area && fit > 0 {
+			break
+		}
+
+		used += cost
+		fit++
+	}
+
+	return len(rendered) - fit
+}
+
+func (m tuiModel) maxMessageScroll() int {
+	_, textWidth := m.chatWidths()
+
+	return maxScroll(m.renderMessages(textWidth), m.messageAreaHeight())
+}
+
+func (m tuiModel) chatView() string {
+	boxWidth, textWidth := m.chatWidths()
+	area := m.messageAreaHeight()
+	rendered := m.renderMessages(textWidth)
+
+	scroll := min(m.messageScroll, maxScroll(rendered, area))
+	start, end := messageWindow(rendered, area, scroll)
+
+	var content string
+
+	if len(rendered) == 0 {
+		content = hintStyle.Render("No messages yet.")
+	} else {
+		content = strings.Join(rendered[start:end], "\n\n")
+
+		// A single message taller than the area: show its end.
+		if lines := strings.Split(content, "\n"); len(lines) > area {
+			content = strings.Join(lines[len(lines)-area:], "\n")
 		}
 	}
 
 	messageBox := lipgloss.NewStyle().
-		Width(chatWidth).
-		Height(18).
+		Width(boxWidth).
+		Height(area+2).
 		Border(lipgloss.RoundedBorder()).
 		Padding(1, 2).
-		Render(messageList.String())
+		Render(content)
 
-	b.WriteString(messageBox)
-	b.WriteString("\n\n")
+	header := logoStyle.
+		UnsetMarginBottom().
+		Render("OSTRICH   /   " + sanitize(m.currentChat.Username))
 
-	inputWidth := chatWidth - 4
+	var status []string
 
-	if inputWidth < 20 {
-		inputWidth = 20
+	if start > 0 {
+		status = append(status, fmt.Sprintf("↑ %d older", start))
 	}
 
-	input := m.messageInput
-	input.Width = inputWidth
-
-	inputBox := lipgloss.NewStyle().
-		Width(chatWidth).
-		Border(lipgloss.RoundedBorder()).
-		Padding(0, 1).
-		Render("> " + input.View())
-
-	b.WriteString(inputBox)
-	b.WriteString("\n\n")
-
-	b.WriteString(
-		hintStyle.Render(
-			"Enter Send   Esc Back   Ctrl+C Quit",
-		),
-	)
-
-	b.WriteString("\n")
-
-	if m.err != nil {
-		b.WriteString(
-			errorStyle.Render(
-				"Error: " + m.err.Error(),
-			),
-		)
-
-		b.WriteString("\n")
+	if end < len(rendered) {
+		status = append(status, fmt.Sprintf("↓ %d newer", len(rendered)-end))
 	}
 
-	return b.String()
+	if len(status) > 0 {
+		header += "   " + hintStyle.Render(strings.Join(status, "   "))
+	}
+
+	return "\n" + header + "\n\n" + messageBox + "\n\n" + m.chatFooter(boxWidth)
 }
